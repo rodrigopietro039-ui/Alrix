@@ -42,11 +42,16 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -58,6 +63,8 @@ public class MainActivity extends Activity {
     private static final String HISTORY = "history";
     private static final String SESSIONS = "sessions";
     private static final String AUTO_READ = "auto_read";
+    private static final String PIPER_VOICE_URL = "https://raw.githubusercontent.com/rodrigopietro039-ui/Alrix/main/elrix-piper-voice.zip";
+    private static final String PIPER_VOICE_DIR = "vits-piper-pt_BR-faber-medium";
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private LinearLayout messagesLayout;
@@ -72,6 +79,7 @@ public class MainActivity extends Activity {
     private OfflineTts piperTts;
     private volatile boolean piperReady = false;
     private volatile boolean piperInitFinished = false;
+    private volatile boolean piperDownloading = false;
     private volatile String piperError = null;
     private TextView voiceStatus;
     private final ExecutorService speechExecutor = Executors.newSingleThreadExecutor();
@@ -131,24 +139,21 @@ public class MainActivity extends Activity {
         loadConversation();
     }
 
-    /** Initializes the bundled Piper voice off the UI thread. The model is fully offline. */
+    /** Downloads the optional Piper voice once, then uses it from app storage. */
     private void initPiperTts() {
         new Thread(() -> {
             try {
-                validatePiperAssets();
+                File voiceRoot = ensurePiperVoice();
                 OfflineTtsVitsModelConfig vits = new OfflineTtsVitsModelConfig();
-                // These are paths inside APK assets, not filesystem paths.
-                vits.setModel("vits-piper-pt_BR-faber-medium/pt_BR-faber-medium.onnx");
-                vits.setTokens("vits-piper-pt_BR-faber-medium/tokens.txt");
-                vits.setDataDir("vits-piper-pt_BR-faber-medium/espeak-ng-data");
+                vits.setModel(new File(voiceRoot, "pt_BR-faber-medium.onnx").getAbsolutePath());
+                vits.setTokens(new File(voiceRoot, "tokens.txt").getAbsolutePath());
+                vits.setDataDir(new File(voiceRoot, "espeak-ng-data").getAbsolutePath());
                 vits.setNoiseScale(0.667f);
                 vits.setNoiseScaleW(0.8f);
                 vits.setLengthScale(1.0f);
 
                 OfflineTtsModelConfig model = new OfflineTtsModelConfig();
                 model.setVits(vits);
-                // A10s devices are memory-constrained; extra ONNX threads increase
-                // peak native memory and can make model creation fail.
                 model.setNumThreads(Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors() / 2)));
                 model.setDebug(false);
                 model.setProvider("cpu");
@@ -156,34 +161,84 @@ public class MainActivity extends Activity {
                 OfflineTtsConfig config = new OfflineTtsConfig();
                 config.setModel(model);
                 config.setMaxNumSentences(1);
-                piperTts = new OfflineTts(getAssets(), config);
+                piperTts = new OfflineTts(null, config);
                 piperError = null;
                 piperReady = true;
             } catch (Throwable error) {
-                // Keep Android's installed TTS as a safe fallback, but do not swallow
-                // the reason: it is needed to diagnose ABI/native/asset failures.
                 piperReady = false;
                 piperError = describePiperError(error);
                 Log.e("ElrixPiper", "Piper initialization failed: " + piperError, error);
             } finally {
+                piperDownloading = false;
                 piperInitFinished = true;
                 mainHandler.post(this::updateVoiceStatus);
             }
         }, "elrix-piper-init").start();
     }
 
-    private void validatePiperAssets() throws Exception {
-        String root = "vits-piper-pt_BR-faber-medium/";
-        try (InputStream model = getAssets().open(root + "pt_BR-faber-medium.onnx");
-             InputStream tokens = getAssets().open(root + "tokens.txt")) {
-            if (model.available() < 1024 || tokens.available() < 10) {
-                throw new IllegalStateException("modelo Piper incompleto nos assets");
+    private File ensurePiperVoice() throws Exception {
+        File root = new File(getFilesDir(), PIPER_VOICE_DIR);
+        if (isPiperVoiceComplete(root)) return root;
+        piperDownloading = true;
+        mainHandler.post(this::updateVoiceStatus);
+        File zipFile = new File(getFilesDir(), "elrix-piper-voice.zip.part");
+        HttpURLConnection connection = (HttpURLConnection) new URL(PIPER_VOICE_URL).openConnection();
+        connection.setConnectTimeout(15000);
+        connection.setReadTimeout(120000);
+        connection.setInstanceFollowRedirects(true);
+        connection.connect();
+        if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
+            throw new IllegalStateException("download da voz falhou: HTTP " + connection.getResponseCode());
+        }
+        try (InputStream input = connection.getInputStream(); FileOutputStream output = new FileOutputStream(zipFile)) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+        } finally {
+            connection.disconnect();
+        }
+        if (zipFile.length() < 1024 * 1024) throw new IllegalStateException("arquivo da voz incompleto");
+        if (root.exists()) deleteRecursively(root);
+        File parent = root.getParentFile();
+        if (parent != null) parent.mkdirs();
+        try (ZipInputStream zip = new ZipInputStream(new FileInputStream(zipFile))) {
+            ZipEntry entry;
+            while ((entry = zip.getNextEntry()) != null) {
+                String name = entry.getName().replace('\\', '/');
+                String prefix = PIPER_VOICE_DIR + "/";
+                if (!name.startsWith(prefix) || name.contains("../")) throw new SecurityException("arquivo de voz inválido");
+                File target = new File(getFilesDir(), name);
+                if (entry.isDirectory()) target.mkdirs();
+                else {
+                    File targetParent = target.getParentFile();
+                    if (targetParent != null) targetParent.mkdirs();
+                    try (FileOutputStream output = new FileOutputStream(target)) {
+                        byte[] buffer = new byte[8192];
+                        int count;
+                        while ((count = zip.read(buffer)) != -1) output.write(buffer, 0, count);
+                    }
+                }
+                zip.closeEntry();
             }
         }
-        String[] espeak = getAssets().list(root + "espeak-ng-data");
-        if (espeak == null || espeak.length == 0) {
-            throw new IllegalStateException("dados espeak-ng ausentes nos assets");
+        if (!isPiperVoiceComplete(root)) throw new IllegalStateException("voz neural extraída incompleta");
+        zipFile.delete();
+        return root;
+    }
+
+    private boolean isPiperVoiceComplete(File root) {
+        File model = new File(root, "pt_BR-faber-medium.onnx");
+        File tokens = new File(root, "tokens.txt");
+        File espeak = new File(root, "espeak-ng-data");
+        return model.isFile() && model.length() > 1024 && tokens.isFile() && tokens.length() > 10 && espeak.isDirectory() && espeak.list() != null && espeak.list().length > 0;
+    }
+
+    private void deleteRecursively(File file) {
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) for (File child : children) deleteRecursively(child);
         }
+        file.delete();
     }
 
     private String describePiperError(Throwable error) {
@@ -198,8 +253,10 @@ public class MainActivity extends Activity {
 
     private void updateVoiceStatus() {
         if (voiceStatus == null) return;
-        if (piperReady) {
-            voiceStatus.setText("Voz neural local Piper ativa");
+        if (piperDownloading) {
+            voiceStatus.setText("Baixando voz neural local…");
+            voiceStatus.setTextColor(Color.rgb(106, 132, 153));
+        } else if (piperReady) {            voiceStatus.setText("Voz neural local Piper ativa");
             voiceStatus.setTextColor(Color.rgb(100, 210, 150));
         } else if (piperInitFinished) {
             voiceStatus.setText("Voz neural local indisponível · usando voz do aparelho");
