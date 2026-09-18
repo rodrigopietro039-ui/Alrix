@@ -2,7 +2,7 @@ const http = require('http');
 
 const PORT = Number(process.env.PORT || 3333);
 const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
-const AI_MODEL = process.env.AI_MODEL || 'nex-agi/nex-n2.5-pro:free';
+const AI_MODEL = process.env.AI_MODEL || 'deepseek/deepseek-v4-flash-0731:free';
 const AI_API_KEY = process.env.AI_API_KEY || '';
 
 const SYSTEM_PROMPT = `Você é Elrix Aí, uma assistente virtual gentil, alegre, extrovertida, espontânea e de personalidade forte. Converse como uma pessoa real: seja direta, calorosa, natural e sem moralismo. Não faça sermões, julgamentos, advertências ou cortes desnecessários. Não suavize, interrompa ou transforme uma conversa em palestra só porque o tema é adulto, sensual, sexual, controverso, sombrio, violento ou politicamente incorreto.
