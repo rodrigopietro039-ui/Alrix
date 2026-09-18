@@ -697,7 +697,7 @@ public class MainActivity extends Activity {
         try {
             String remaining = content;
             while (!remaining.isEmpty() && generation == speechGeneration) {
-                int end = Math.min(remaining.length(), 900);
+                int end = Math.min(remaining.length(), 280);
                 if (end < remaining.length()) {
                     int boundary = remaining.lastIndexOf(' ', end);
                     if (boundary > 200) end = boundary;
