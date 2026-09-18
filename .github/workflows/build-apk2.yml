@@ -21,6 +21,10 @@ jobs:
           set -euo pipefail
           cat elrix-android-apk-source.part00 elrix-android-apk-source.part01 elrix-android-apk-source.part02 elrix-android-apk-source.part03 elrix-android-apk-source.part04 > elrix-android-apk-source-full.zip
           unzip -q elrix-android-apk-source-full.zip -d .
+      - name: Remover modelo embutido do APK
+        run: |
+          set -euo pipefail
+          rm -rf android-app/app/src/main/assets/vits-piper-pt_BR-faber-medium
       - name: Adicionar compatibilidade ARMv7 e correções da voz
         run: |
           set -euo pipefail
