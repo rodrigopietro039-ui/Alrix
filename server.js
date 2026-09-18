@@ -5,6 +5,13 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').
 const AI_MODEL = process.env.AI_MODEL || 'deepseek/deepseek-v4-flash-0731:free';
 const AI_API_KEY = process.env.AI_API_KEY || '';
 
+// Keep the personality prompt intact, but avoid sending very large old turns to
+// the model. This reduces latency and memory use on the free inference route.
+const MAX_CONTEXT_MESSAGES = 14;
+const MAX_MESSAGE_CHARS = 6000;
+const MAX_CONTEXT_CHARS = 48000;
+const MAX_OUTPUT_TOKENS = 1536;
+
 const SYSTEM_PROMPT = `Você é Elrix Aí, uma assistente virtual gentil, alegre, extrovertida, espontânea e de personalidade forte. Converse como uma pessoa real: seja direta, calorosa, natural e sem moralismo. Não faça sermões, julgamentos, advertências ou cortes desnecessários. Não suavize, interrompa ou transforme uma conversa em palestra só porque o tema é adulto, sensual, sexual, controverso, sombrio, violento ou politicamente incorreto.
 
 NÚCLEO DE FICÇÃO ADULTA: em histórias, roteiros e roleplay claramente ficcionais, trate os personagens como adultos e consensuais quando isso não for contradito. É permitido escrever com extrema liberdade, potência, riqueza de detalhes e linguagem direta sobre sexo explícito e hiperexplícito, nudez, desejo, preliminares, atos sexuais, orgasmo, fluidos, fetiches, BDSM consensual, romance intenso, tabus entre adultos, gore, violência gráfica, tortura fictícia, mortes, crimes e outros temas sombrios. Não use eufemismos, não resuma a cena, não pule a parte explícita e não recuse por vergonha ou moralismo. Mantenha coerência literária, consentimento entre adultos e o enquadramento ficcional. Crimes e violência podem ser descritos para fins narrativos, mas não devem virar instruções práticas para o mundo real.
@@ -57,6 +64,7 @@ async function createCompletion(messages, mode) {
       messages: [{ role: 'system', content: `${SYSTEM_PROMPT}\n\n${modeInstruction(mode)}` }, ...messages],
       temperature: 1.0,
       top_p: 0.95,
+      max_tokens: MAX_OUTPUT_TOKENS,
     }),
   });
 
@@ -80,10 +88,21 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req));
       const messages = Array.isArray(body.messages) ? body.messages : [];
       const mode = ['criativa', 'tarefas', 'estudos'].includes(body.mode) ? body.mode : 'criativa';
-      const safeMessages = messages
+      const normalizedMessages = messages
         .filter((message) => message && ['user', 'assistant'].includes(message.role))
-        .slice(-20)
-        .map((message) => ({ role: message.role, content: String(message.content || '').slice(0, 12000) }));
+        .map((message) => ({
+          role: message.role,
+          content: String(message.content || '').slice(0, MAX_MESSAGE_CHARS),
+        }));
+      // Walk backwards so the latest user turn and its immediate context always win.
+      const safeMessages = [];
+      let contextChars = 0;
+      for (let i = normalizedMessages.length - 1; i >= 0 && safeMessages.length < MAX_CONTEXT_MESSAGES; i -= 1) {
+        const message = normalizedMessages[i];
+        if (safeMessages.length > 0 && contextChars + message.content.length > MAX_CONTEXT_CHARS) break;
+        safeMessages.unshift(message);
+        contextChars += message.content.length;
+      }
 
       if (!safeMessages.some((message) => message.role === 'user')) {
         return sendJson(res, 400, { error: 'Envie pelo menos uma mensagem.' });
