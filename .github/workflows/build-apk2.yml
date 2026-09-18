@@ -1,0 +1,24 @@
+name: Build Elrix APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - run: unzip -q elrix-android-apk-source.zip -d .
+      - run: gradle -p android-app assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elrix-ai-apk
+          path: android-app/app/build/outputs/apk/debug/app-debug.apk
