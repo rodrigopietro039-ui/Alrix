@@ -1,31 +1,49 @@
 name: Build Elrix APK
-
 on:
   push:
     branches: [main]
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-
       - name: Configurar Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-35 build-tools;35.0.0'
-
       - name: Preparar projeto Android
         run: |
+          set -euo pipefail
           cat elrix-android-apk-source.part00 elrix-android-apk-source.part01 elrix-android-apk-source.part02 elrix-android-apk-source.part03 elrix-android-apk-source.part04 > elrix-android-apk-source-full.zip
           unzip -q elrix-android-apk-source-full.zip -d .
-
+      - name: Adicionar compatibilidade ARMv7
+        run: |
+          set -euo pipefail
+          mkdir -p android-app/app/src/main/jniLibs/armeabi-v7a
+          for lib in libonnxruntime.so libsherpa-onnx-c-api.so libsherpa-onnx-cxx-api.so libsherpa-onnx-jni.so; do
+            test -f "$lib"
+            cp "$lib" "android-app/app/src/main/jniLibs/armeabi-v7a/$lib"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android-app/app/build.gradle')
+          s = p.read_text()
+          old = s
+          for a, b in (
+              ('abiFilters "arm64-v8a"', 'abiFilters "arm64-v8a", "armeabi-v7a"'),
+              ("abiFilters 'arm64-v8a'", "abiFilters 'arm64-v8a', 'armeabi-v7a'"),
+          ):
+              s = s.replace(a, b)
+          if s == old:
+              raise SystemExit('Não foi possível localizar o filtro ABI arm64-v8a no build.gradle')
+          p.write_text(s)
+          PY
+          grep -n "abiFilters" android-app/app/build.gradle
       - name: Criar assinatura da versão oficial
         run: |
           keytool -genkeypair -v -keystore "$RUNNER_TEMP/elrix-release.keystore" -alias elrix -keyalg RSA -keysize 2048 -validity 10000 -storepass 'ElrixRelease2026!' -keypass 'ElrixRelease2026!' -dname 'CN=Elrix Aí, OU=Elrix, O=Elrix, L=BR, ST=SP, C=BR'
@@ -33,10 +51,16 @@ jobs:
           echo "ELRIX_STORE_PASSWORD=ElrixRelease2026!" >> "$GITHUB_ENV"
           echo "ELRIX_KEY_ALIAS=elrix" >> "$GITHUB_ENV"
           echo "ELRIX_KEY_PASSWORD=ElrixRelease2026!" >> "$GITHUB_ENV"
-
       - name: Gerar APK oficial Release
         run: gradle -p android-app assembleRelease --no-daemon
-
+      - name: Verificar ABIs no APK
+        run: |
+          set -euo pipefail
+          apk=android-app/app/build/outputs/apk/release/app-release.apk
+          unzip -l "$apk" | grep -E 'lib/(arm64-v8a|armeabi-v7a)/(libsherpa-onnx-jni|libonnxruntime)\.so'
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libsherpa-onnx-jni.so'
+          unzip -l "$apk" | grep -q 'lib/armeabi-v7a/libsherpa-onnx-jni.so'
+          unzip -l "$apk" | grep -q 'lib/armeabi-v7a/libonnxruntime.so'
       - uses: actions/upload-artifact@v4
         with:
           name: elrix-ai-apk-oficial
