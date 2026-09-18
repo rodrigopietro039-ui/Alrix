@@ -54,8 +54,11 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final String API_URL = "https://alrix.onrender.com/chat";
@@ -65,6 +68,10 @@ public class MainActivity extends Activity {
     private static final String AUTO_READ = "auto_read";
     private static final String PIPER_VOICE_PART_URL = "https://raw.githubusercontent.com/rodrigopietro039-ui/Alrix/main/elrix-piper-voice.part%02d";
     private static final int PIPER_VOICE_PARTS = 9;
+    // A small pipeline keeps Piper generation ahead of AudioTrack without making
+    // concurrent native calls.  0.94 is a subtle ~6% slowdown for clarity.
+    private static final float PIPER_SPEED = 0.94f;
+    private static final int PIPER_AUDIO_QUEUE_CAPACITY = 2;
     private static final String PIPER_VOICE_DIR = "vits-piper-pt_BR-faber-medium";
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -85,6 +92,30 @@ public class MainActivity extends Activity {
     private TextView voiceStatus;
     private final ExecutorService speechExecutor = Executors.newSingleThreadExecutor();
     private volatile AudioTrack piperTrack;
+    private final Object piperGenerationLock = new Object();
+
+    private static final class PiperAudioChunk {
+        final float[] samples;
+        final int sampleRate;
+        final Throwable error;
+        final boolean end;
+
+        PiperAudioChunk(float[] samples, int sampleRate) {
+            this.samples = samples;
+            this.sampleRate = sampleRate;
+            this.error = null;
+            this.end = false;
+        }
+
+        PiperAudioChunk(Throwable error) {
+            this.samples = null;
+            this.sampleRate = 0;
+            this.error = error;
+            this.end = true;
+        }
+
+        static PiperAudioChunk end(Throwable error) { return new PiperAudioChunk(error); }
+    }
     private volatile int speechGeneration = 0;
     private boolean autoRead = false;
     private String pendingSpeech = null;
@@ -93,6 +124,12 @@ public class MainActivity extends Activity {
     private JSONArray sessions = new JSONArray();
     private String mode = "criativa";
     private boolean sending = false;
+    private boolean streamingReplyActive = false;
+    private TextView streamingBubble;
+
+    private interface StreamListener {
+        void onText(String text);
+    }
 
     private int dp(float value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
@@ -592,6 +629,9 @@ public class MainActivity extends Activity {
         bubble.setGravity(Gravity.CENTER_VERTICAL);
         bubble.setBackground(round(user ? Color.rgb(12, 99, 190) : Color.rgb(15, 23, 38), dp(18)));
         bubbleBox.addView(bubble, new LinearLayout.LayoutParams(dp(310), -2));
+        if (streamingReplyActive && !user && index == conversation.length() - 1) {
+            streamingBubble = bubble;
+        }
 
         // Ações ficam em um quadrinho ao pressionar a mensagem; copiar/regenerar ficam acessíveis abaixo.
         bubble.setOnLongClickListener(v -> {
@@ -693,22 +733,64 @@ public class MainActivity extends Activity {
     }
 
     private void speakWithPiper(String content, int generation) {
-        AudioTrack track = null;
-        try {
-            String remaining = content;
-            while (!remaining.isEmpty() && generation == speechGeneration) {
-                int end = Math.min(remaining.length(), 280);
-                if (end < remaining.length()) {
-                    int boundary = remaining.lastIndexOf(' ', end);
-                    if (boundary > 200) end = boundary;
+        final BlockingQueue<PiperAudioChunk> queue = new ArrayBlockingQueue<>(PIPER_AUDIO_QUEUE_CAPACITY);
+        final Throwable[] producerError = new Throwable[1];
+        final String[] producerRemaining = new String[]{content};
+        final Thread producer = new Thread(() -> {
+            try {
+                String remaining = producerRemaining[0];
+                while (!remaining.isEmpty() && generation == speechGeneration) {
+                    int end = Math.min(remaining.length(), 900);
+                    if (end < remaining.length()) {
+                        int boundary = remaining.lastIndexOf(' ', end);
+                        if (boundary > 200) end = boundary;
+                    }
+                    String chunk = remaining.substring(0, end).trim();
+                    GeneratedAudio audio;
+                    // Piper's native object is deliberately serialized.  The
+                    // producer is the only caller, while playback consumes the
+                    // already generated audio on the current speech worker.
+                    synchronized (piperGenerationLock) {
+                        if (generation != speechGeneration) break;
+                        audio = piperTts.generate(chunk, 0, PIPER_SPEED);
+                    }
+                    PiperAudioChunk packet = new PiperAudioChunk(audio.getSamples(), audio.getSampleRate());
+                    while (generation == speechGeneration && !queue.offer(packet, 200, TimeUnit.MILLISECONDS)) {
+                        // Wait for AudioTrack to consume a queued chunk.
+                    }
+                    remaining = remaining.substring(end).trim();
                 }
-                String chunk = remaining.substring(0, end).trim();
-                GeneratedAudio audio = piperTts.generate(chunk, 0, 0.92f);
+            } catch (Throwable error) {
+                if (generation == speechGeneration) producerError[0] = error;
+            } finally {
+                if (generation != speechGeneration) {
+                    queue.clear();
+                } else {
+                    try {
+                        while (!queue.offer(PiperAudioChunk.end(producerError[0]), 200, TimeUnit.MILLISECONDS)) {
+                            // Let the consumer drain the final audio first.
+                        }
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }, "elrix-piper-producer");
+
+        AudioTrack track = null;
+        producer.start();
+        try {
+            while (generation == speechGeneration) {
+                PiperAudioChunk packet = queue.poll(200, TimeUnit.MILLISECONDS);
+                if (packet == null) continue;
+                if (packet.end) {
+                    if (packet.error != null) throw packet.error;
+                    break;
+                }
                 if (track == null) {
-                    // PCM16 is better supported than PCM_FLOAT by older Samsung
-                    // AudioTrack implementations and uses less playback memory.
+                    // Reuse one PCM AudioTrack for every generated chunk.
                     int minBuffer = AudioTrack.getMinBufferSize(
-                            audio.getSampleRate(), AudioFormat.CHANNEL_OUT_MONO,
+                            packet.sampleRate, AudioFormat.CHANNEL_OUT_MONO,
                             AudioFormat.ENCODING_PCM_16BIT);
                     if (minBuffer <= 0) minBuffer = 8192;
                     AudioAttributes attributes = new AudioAttributes.Builder()
@@ -717,7 +799,7 @@ public class MainActivity extends Activity {
                             .build();
                     AudioFormat format = new AudioFormat.Builder()
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(audio.getSampleRate())
+                            .setSampleRate(packet.sampleRate)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build();
                     track = new AudioTrack(attributes, format, Math.max(minBuffer, 8192),
@@ -729,7 +811,7 @@ public class MainActivity extends Activity {
                     piperTrack = track;
                     track.play();
                 }
-                float[] samples = audio.getSamples();
+                float[] samples = packet.samples;
                 short[] pcm = new short[samples.length];
                 for (int i = 0; i < samples.length; i++) {
                     float value = Math.max(-1.0f, Math.min(1.0f, samples[i]));
@@ -741,8 +823,10 @@ public class MainActivity extends Activity {
                     if (written <= 0) break;
                     offset += written;
                 }
-                remaining = remaining.substring(end).trim();
             }
+            if (producerError[0] != null) throw producerError[0];
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
         } catch (Throwable error) {
             // Do not crash the conversation if a low-memory device rejects neural playback.
             piperReady = false;
@@ -750,6 +834,13 @@ public class MainActivity extends Activity {
             Log.e("ElrixPiper", "Piper playback failed: " + piperError, error);
             mainHandler.post(this::updateVoiceStatus);
         } finally {
+            if (generation != speechGeneration) producer.interrupt();
+            // Do not let a cancelled producer overlap the next native Piper call.
+            synchronized (piperGenerationLock) {
+                try { producer.join(1500); } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             if (track != null) {
                 try { track.stop(); } catch (Exception ignored) { }
                 track.release();
@@ -843,23 +934,40 @@ public class MainActivity extends Activity {
         if (sending) return;
         sending = true;
         setLoading(true);
+        // Create the assistant bubble before the network call. The streaming
+        // endpoint can then paint the first token without waiting for the full answer.
+        streamingReplyActive = true;
+        streamingBubble = null;
+        addMessage("assistant", "");
         new Thread(() -> {
             try {
-                String reply = callBackend(mode);
-                mainHandler.post(() -> {
-                    addMessage("assistant", reply);
-                    if (autoRead) speakMessage(reply);
-                    sending = false;
-                    setLoading(false);
-                });
+                String reply = callBackend(mode, text -> mainHandler.post(() -> updateStreamingReply(text)));
+                mainHandler.post(() -> finishStreamingReply(reply, false));
             } catch (Exception error) {
-                mainHandler.post(() -> {
-                    addMessage("assistant", "Tive um problema de conexão agora. Tente novamente em alguns instantes.");
-                    sending = false;
-                    setLoading(false);
-                });
+                mainHandler.post(() -> finishStreamingReply(
+                        "Tive um problema de conexão agora. Tente novamente em alguns instantes.", true));
             }
-        }).start();
+        }, "elrix-chat-request").start();
+    }
+
+    private void updateStreamingReply(String text) {
+        if (streamingBubble != null) streamingBubble.setText(text);
+    }
+
+    private void finishStreamingReply(String reply, boolean failed) {
+        try {
+            if (conversation.length() > 0) {
+                JSONObject last = conversation.getJSONObject(conversation.length() - 1);
+                if ("assistant".equals(last.optString("role"))) last.put("content", reply);
+            }
+        } catch (Exception ignored) { }
+        streamingReplyActive = false;
+        if (streamingBubble != null) streamingBubble.setText(reply);
+        streamingBubble = null;
+        saveConversation();
+        if (!failed && autoRead) speakMessage(reply);
+        sending = false;
+        setLoading(false);
     }
 
     private void setLoading(boolean loading) {
@@ -880,31 +988,92 @@ public class MainActivity extends Activity {
         if (conversationScroll != null) conversationScroll.post(() -> conversationScroll.fullScroll(View.FOCUS_DOWN));
     }
 
-    private String callBackend(String currentMode) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(API_URL).openConnection();
-        connection.setRequestMethod("POST");
-        connection.setConnectTimeout(20000);
-        connection.setReadTimeout(90000);
-        connection.setDoOutput(true);
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+    private JSONObject buildChatPayload(String currentMode) throws Exception {
         JSONObject payload = new JSONObject();
         payload.put("mode", currentMode);
         JSONArray recent = new JSONArray();
         int start = Math.max(0, conversation.length() - 20);
         for (int i = start; i < conversation.length(); i++) recent.put(conversation.get(i));
         payload.put("messages", recent);
+        return payload;
+    }
+
+    private String callBackend(String currentMode, StreamListener listener) throws Exception {
+        JSONObject payload = buildChatPayload(currentMode);
+        try {
+            return callBackendOnce(payload, "text/event-stream", listener);
+        } catch (Exception streamingError) {
+            // Older deployments and transient SSE/proxy failures still get the
+            // original JSON request.  A partial streamed bubble is replaced by
+            // the complete legacy reply when it succeeds.
+            Log.w("ElrixChat", "SSE indisponível; tentando resposta JSON", streamingError);
+            String reply = callBackendOnce(payload, "application/json", null);
+            if (listener != null) listener.onText(reply);
+            return reply;
+        }
+    }
+
+    private String callBackendOnce(JSONObject payload, String accept, StreamListener listener) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(API_URL).openConnection();
+        connection.setRequestMethod("POST");
+        connection.setConnectTimeout(12000);
+        connection.setReadTimeout(90000);
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+        connection.setRequestProperty("Accept", accept);
         try (OutputStream output = connection.getOutputStream()) {
             output.write(payload.toString().getBytes("UTF-8"));
         }
         int status = connection.getResponseCode();
         InputStream stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream();
-        BufferedReader reader = new BufferedReader(new InputStreamReader(stream));
-        StringBuilder result = new StringBuilder();
-        String line;
-        while ((line = reader.readLine()) != null) result.append(line);
-        JSONObject response = new JSONObject(result.toString());
-        if (status >= 400) throw new Exception(response.optString("error"));
-        return response.optString("reply", "Fiquei sem palavras por um instante. Pode tentar de novo?");
+        if (stream == null) {
+            connection.disconnect();
+            throw new Exception("resposta vazia");
+        }
+        StringBuilder raw = new StringBuilder();
+        StringBuilder deltas = new StringBuilder();
+        boolean sawSse = false;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("data:")) {
+                    sawSse = true;
+                    String event = line.substring(5).trim();
+                    if ("[DONE]".equals(event)) continue;
+                    if (event.isEmpty()) continue;
+                    JSONObject chunk = new JSONObject(event);
+                    String streamError = chunk.optString("error", "");
+                    if (!streamError.isEmpty()) throw new Exception(streamError);
+                    String delta = chunk.optString("delta", "");
+                    if (!delta.isEmpty()) {
+                        deltas.append(delta);
+                        if (listener != null) listener.onText(deltas.toString());
+                    }
+                } else if (!line.trim().isEmpty()) {
+                    raw.append(line.trim());
+                }
+            }
+        } finally {
+            connection.disconnect();
+        }
+        if (status >= 400) {
+            try {
+                String message = new JSONObject(raw.toString()).optString("error", "");
+                throw new Exception(message.isEmpty() ? "resposta de erro do servidor" : message);
+            } catch (org.json.JSONException ignored) {
+                throw new Exception("resposta de erro do servidor");
+            }
+        }
+        String reply;
+        if (sawSse) {
+            reply = deltas.toString();
+        } else if (raw.toString().startsWith("{")) {
+            reply = new JSONObject(raw.toString()).optString("reply", "");
+        } else {
+            reply = raw.toString();
+        }
+        if (reply.trim().isEmpty()) throw new Exception("resposta vazia");
+        return reply;
     }
 
     @Override
