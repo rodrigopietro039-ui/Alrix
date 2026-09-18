@@ -63,7 +63,8 @@ public class MainActivity extends Activity {
     private static final String HISTORY = "history";
     private static final String SESSIONS = "sessions";
     private static final String AUTO_READ = "auto_read";
-    private static final String PIPER_VOICE_URL = "https://raw.githubusercontent.com/rodrigopietro039-ui/Alrix/main/elrix-piper-voice.zip";
+    private static final String PIPER_VOICE_PART_URL = "https://raw.githubusercontent.com/rodrigopietro039-ui/Alrix/main/elrix-piper-voice.part%02d";
+    private static final int PIPER_VOICE_PARTS = 9;
     private static final String PIPER_VOICE_DIR = "vits-piper-pt_BR-faber-medium";
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -182,20 +183,24 @@ public class MainActivity extends Activity {
         piperDownloading = true;
         mainHandler.post(this::updateVoiceStatus);
         File zipFile = new File(getFilesDir(), "elrix-piper-voice.zip.part");
-        HttpURLConnection connection = (HttpURLConnection) new URL(PIPER_VOICE_URL).openConnection();
-        connection.setConnectTimeout(15000);
-        connection.setReadTimeout(120000);
-        connection.setInstanceFollowRedirects(true);
-        connection.connect();
-        if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
-            throw new IllegalStateException("download da voz falhou: HTTP " + connection.getResponseCode());
-        }
-        try (InputStream input = connection.getInputStream(); FileOutputStream output = new FileOutputStream(zipFile)) {
+        try (FileOutputStream output = new FileOutputStream(zipFile)) {
             byte[] buffer = new byte[8192];
-            int count;
-            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
-        } finally {
-            connection.disconnect();
+            for (int part = 0; part < PIPER_VOICE_PARTS; part++) {
+                HttpURLConnection connection = (HttpURLConnection) new URL(String.format(Locale.ROOT, PIPER_VOICE_PART_URL, part)).openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(120000);
+                connection.setInstanceFollowRedirects(true);
+                connection.connect();
+                if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                    throw new IllegalStateException("download da voz falhou: HTTP " + connection.getResponseCode());
+                }
+                try (InputStream input = connection.getInputStream()) {
+                    int count;
+                    while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                } finally {
+                    connection.disconnect();
+                }
+            }
         }
         if (zipFile.length() < 1024 * 1024) throw new IllegalStateException("arquivo da voz incompleto");
         if (root.exists()) deleteRecursively(root);
