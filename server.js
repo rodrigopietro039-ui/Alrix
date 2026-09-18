@@ -48,6 +48,17 @@ function modeInstruction(mode) {
   return 'Modo atual: Criatividade. Priorize imaginação, associações originais, ritmo e liberdade de estilo.';
 }
 
+function completionPayload(messages, mode, stream = false) {
+  return {
+    model: AI_MODEL,
+    messages: [{ role: 'system', content: `${SYSTEM_PROMPT}\n\n${modeInstruction(mode)}` }, ...messages],
+    temperature: 1.0,
+    top_p: 0.95,
+    max_tokens: MAX_OUTPUT_TOKENS,
+    stream,
+  };
+}
+
 async function createCompletion(messages, mode) {
   if (!AI_API_KEY) {
     throw new Error('AI_API_KEY não configurada');
@@ -59,13 +70,7 @@ async function createCompletion(messages, mode) {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${AI_API_KEY}`,
     },
-    body: JSON.stringify({
-      model: AI_MODEL,
-      messages: [{ role: 'system', content: `${SYSTEM_PROMPT}\n\n${modeInstruction(mode)}` }, ...messages],
-      temperature: 1.0,
-      top_p: 0.95,
-      max_tokens: MAX_OUTPUT_TOKENS,
-    }),
+    body: JSON.stringify(completionPayload(messages, mode)),
   });
 
   const data = await response.json();
@@ -74,6 +79,69 @@ async function createCompletion(messages, mode) {
   }
 
   return data?.choices?.[0]?.message?.content || 'Fiquei sem palavras por um instante. Pode tentar de novo?';
+}
+
+async function streamCompletion(messages, mode, res) {
+  if (!AI_API_KEY) throw new Error('AI_API_KEY não configurada');
+
+  const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${AI_API_KEY}`,
+    },
+    body: JSON.stringify(completionPayload(messages, mode, true)),
+  });
+  if (!response.ok || !response.body) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data?.error?.message || 'O serviço de IA não respondeu');
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
+    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+  });
+  res.flushHeaders?.();
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const delta = JSON.parse(payload)?.choices?.[0]?.delta?.content;
+          if (typeof delta === 'string' && delta.length > 0) {
+            res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+          }
+        } catch (_) {
+          // Ignore an incomplete/non-content upstream SSE event.
+        }
+      }
+      if (done) break;
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (error) {
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: 'A transmissão foi interrompida.' })}\n\n`);
+      res.end();
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -108,10 +176,15 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 400, { error: 'Envie pelo menos uma mensagem.' });
       }
 
+      if (req.headers.accept?.includes('text/event-stream')) {
+        await streamCompletion(safeMessages, mode, res);
+        return;
+      }
       const reply = await createCompletion(safeMessages, mode);
       return sendJson(res, 200, { reply });
     } catch (error) {
       console.error(error.message);
+      if (res.headersSent || res.writableEnded) return;
       return sendJson(res, 500, { error: 'Não consegui falar com o cérebro da Elrix agora.' });
     }
   }
