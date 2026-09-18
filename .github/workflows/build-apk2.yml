@@ -22,7 +22,9 @@ jobs:
           packages: 'platforms;android-35 build-tools;35.0.0'
 
       - name: Preparar projeto Android
-        run: unzip -q elrix-android-apk-source.zip -d .
+        run: |
+          cat elrix-android-apk-source.part00 elrix-android-apk-source.part01 elrix-android-apk-source.part02 elrix-android-apk-source.part03 elrix-android-apk-source.part04 > elrix-android-apk-source-full.zip
+          unzip -q elrix-android-apk-source-full.zip -d .
 
       - name: Criar assinatura da versão oficial
         run: |
