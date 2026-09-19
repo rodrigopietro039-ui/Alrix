@@ -72,12 +72,13 @@ public class MainActivity extends Activity {
     // A small pipeline keeps Piper generation ahead of AudioTrack without making
     // concurrent native calls.  0.94 is a subtle ~6% slowdown for clarity.
     private static final float PIPER_SPEED = 0.94f;
-    private static final int PIPER_AUDIO_QUEUE_CAPACITY = 4;
+    private static final int PIPER_AUDIO_QUEUE_CAPACITY = 8;
     // Keep each native call short enough that the producer can stay ahead of
     // AudioTrack on low-end phones, while retaining word boundaries.
-    private static final int PIPER_TEXT_CHUNK_CHARS = 240;
-    private static final int PIPER_TEXT_CHUNK_MIN_CHARS = 80;
-    private static final int PIPER_AUDIO_BUFFER_MILLIS = 250;
+    private static final int PIPER_TEXT_CHUNK_CHARS = 96;
+    private static final int PIPER_TEXT_CHUNK_MIN_CHARS = 32;
+    private static final int PIPER_AUDIO_BUFFER_MILLIS = 350;
+    private static final int PIPER_PREBUFFER_CHUNKS = 2;
     // Keep the first neural utterance short enough to reach AudioTrack quickly.
     // A sentence boundary is preferred; the bounded fallback is only used for
     // long streams that have not emitted punctuation yet.
@@ -176,7 +177,7 @@ public class MainActivity extends Activity {
                 voiceReady = textToSpeech.getLanguage() != null;
                 textToSpeech.setSpeechRate(0.92f);
                 textToSpeech.setPitch(0.82f);
-                if (autoRead && pendingSpeech != null) {
+                if (pendingSpeech != null) {
                     String queued = pendingSpeech;
                     pendingSpeech = null;
                     speakMessage(queued);
@@ -836,6 +837,15 @@ public class MainActivity extends Activity {
         producer.start();
         try {
             while (generation == speechGeneration && !pipelineCancelled.get()) {
+                // Do not start AudioTrack with only the first packet. On slower
+                // phones that makes the first Piper call finish just as the
+                // buffer empties, producing the long pauses reported by users.
+                // Wait until two packets are ready, or until the producer ends
+                // for a short response.
+                if (track == null && producer.isAlive() && queue.size() < PIPER_PREBUFFER_CHUNKS) {
+                    Thread.sleep(25);
+                    continue;
+                }
                 PiperAudioChunk packet = queue.poll(200, TimeUnit.MILLISECONDS);
                 if (packet == null) continue;
                 if (packet.end) {
@@ -916,7 +926,8 @@ public class MainActivity extends Activity {
     private void stopPiperPlayback() {
         AudioTrack track = piperTrack;
         if (track != null) {
-            try { track.pause(); track.flush(); } catch (Exception ignored) { }
+            try { track.pause(); } catch (Exception ignored) { }
+            try { track.flush(); } catch (Exception ignored) { }
         }
     }
 
