@@ -35,6 +35,7 @@ jobs:
           done
           cp MainActivity-fixed.java android-app/app/src/main/java/com/elrixai/app/MainActivity.java
           cp OfflineTts-fixed.kt android-app/app/src/main/java/com/elrixai/app/OfflineTts.kt
+          patch -p1 < voice-latency.patch/voice-latency.patch
           rm -rf android-app/app/src/main/assets/vits-piper-pt_BR-faber-medium
           test ! -e android-app/app/src/main/assets/vits-piper-pt_BR-faber-medium
           python3 - <<'PY'
