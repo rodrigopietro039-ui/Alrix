@@ -59,6 +59,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MainActivity extends Activity {
     private static final String API_URL = "https://alrix.onrender.com/chat";
@@ -71,7 +72,17 @@ public class MainActivity extends Activity {
     // A small pipeline keeps Piper generation ahead of AudioTrack without making
     // concurrent native calls.  0.94 is a subtle ~6% slowdown for clarity.
     private static final float PIPER_SPEED = 0.94f;
-    private static final int PIPER_AUDIO_QUEUE_CAPACITY = 2;
+    private static final int PIPER_AUDIO_QUEUE_CAPACITY = 4;
+    // Keep each native call short enough that the producer can stay ahead of
+    // AudioTrack on low-end phones, while retaining word boundaries.
+    private static final int PIPER_TEXT_CHUNK_CHARS = 240;
+    private static final int PIPER_TEXT_CHUNK_MIN_CHARS = 80;
+    private static final int PIPER_AUDIO_BUFFER_MILLIS = 250;
+    // Keep the first neural utterance short enough to reach AudioTrack quickly.
+    // A sentence boundary is preferred; the bounded fallback is only used for
+    // long streams that have not emitted punctuation yet.
+    private static final int STREAM_SPEECH_MIN_CHARS = 12;
+    private static final int STREAM_SPEECH_FALLBACK_CHARS = 96;
     private static final String PIPER_VOICE_DIR = "vits-piper-pt_BR-faber-medium";
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -86,6 +97,7 @@ public class MainActivity extends Activity {
     // Offline neural voice: Piper pt_BR-faber-medium through Sherpa-ONNX.
     private OfflineTts piperTts;
     private volatile boolean piperReady = false;
+    private volatile boolean piperWarmed = false;
     private volatile boolean piperInitFinished = false;
     private volatile boolean piperDownloading = false;
     private volatile String piperError = null;
@@ -93,6 +105,7 @@ public class MainActivity extends Activity {
     private final ExecutorService speechExecutor = Executors.newSingleThreadExecutor();
     private volatile AudioTrack piperTrack;
     private final Object piperGenerationLock = new Object();
+    private final Object streamingSpeechLock = new Object();
 
     private static final class PiperAudioChunk {
         final float[] samples;
@@ -126,6 +139,12 @@ public class MainActivity extends Activity {
     private boolean sending = false;
     private boolean streamingReplyActive = false;
     private TextView streamingBubble;
+    // Auto-read starts once the first complete sentence (or a bounded phrase)
+    // arrives over SSE. The final response only contributes its unspoken tail.
+    private String streamingSpeechCandidate = null;
+    private String streamingSpeechPrefix = null;
+    private String streamingSpeechPendingTail = null;
+    private boolean streamingSpeechWorkerActive = false;
 
     private interface StreamListener {
         void onText(String text);
@@ -202,6 +221,14 @@ public class MainActivity extends Activity {
                 piperTts = new OfflineTts(null, config);
                 piperError = null;
                 piperReady = true;
+                // Constructing the native object is not enough: the first
+                // generate() also pays model/JNI allocator costs. Pay that
+                // unavoidable one-time cost during startup, never on Ouvir.
+                mainHandler.post(this::updateVoiceStatus);
+                synchronized (piperGenerationLock) {
+                    piperTts.generate("Pronto.", 0, PIPER_SPEED);
+                }
+                piperWarmed = true;
             } catch (Throwable error) {
                 piperReady = false;
                 piperError = describePiperError(error);
@@ -209,7 +236,10 @@ public class MainActivity extends Activity {
             } finally {
                 piperDownloading = false;
                 piperInitFinished = true;
-                mainHandler.post(this::updateVoiceStatus);
+                mainHandler.post(() -> {
+                    updateVoiceStatus();
+                    maybeStartStreamingSpeech();
+                });
             }
         }, "elrix-piper-init").start();
     }
@@ -326,8 +356,8 @@ public class MainActivity extends Activity {
 
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(dp(14), dp(14), dp(14), dp(14));
-        root.addView(header, new LinearLayout.LayoutParams(-1, dp(76)));
+        header.setPadding(dp(16), dp(12), dp(16), dp(12));
+        root.addView(header, new LinearLayout.LayoutParams(-1, dp(72)));
 
         Button history = button("☷", Color.rgb(15, 23, 38), Color.rgb(115, 190, 255));
         history.setTextSize(22);
@@ -370,7 +400,7 @@ public class MainActivity extends Activity {
         HorizontalScrollView modeScroll = new HorizontalScrollView(this);
         modeScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout modeBar = new LinearLayout(this);
-        modeBar.setPadding(dp(14), dp(8), dp(14), dp(8));
+        modeBar.setPadding(dp(18), dp(8), dp(18), dp(8));
         modeBar.setGravity(Gravity.CENTER_VERTICAL);
         String[] modes = {"criativa", "tarefas", "estudos"};
         String[] labels = {"✦ Criativa", "✓ Tarefas", "◈ Estudos"};
@@ -385,13 +415,17 @@ public class MainActivity extends Activity {
             modeBar.addView(modeButton, params);
         }
         modeScroll.addView(modeBar);
-        root.addView(modeScroll, new LinearLayout.LayoutParams(-1, dp(54)));
+        root.addView(modeScroll, new LinearLayout.LayoutParams(-1, dp(52)));
 
         conversationScroll = new ScrollView(this);
+        conversationScroll.setFillViewport(true);
+        conversationScroll.setClipToPadding(false);
         messagesLayout = new LinearLayout(this);
         messagesLayout.setOrientation(LinearLayout.VERTICAL);
-        messagesLayout.setPadding(dp(18), dp(16), dp(18), dp(10));
-        conversationScroll.addView(messagesLayout);
+        // Keep a generous reading gutter while leaving almost the full width
+        // available for bubbles on 320–360dp Galaxy A10s screens.
+        messagesLayout.setPadding(dp(16), dp(20), dp(16), dp(18));
+        conversationScroll.addView(messagesLayout, new ScrollView.LayoutParams(-1, -2));
         root.addView(conversationScroll, new LinearLayout.LayoutParams(-1, 0, 1));
 
         typingIndicator = textView("Elrix está pensando  •  •  •", 13, Color.rgb(115, 190, 255));
@@ -401,25 +435,25 @@ public class MainActivity extends Activity {
 
         LinearLayout composer = new LinearLayout(this);
         composer.setGravity(Gravity.BOTTOM);
-        composer.setPadding(dp(14), dp(6), dp(14), dp(6));
+        composer.setPadding(dp(16), dp(8), dp(16), dp(8));
         input = new EditText(this);
         input.setHint("Converse com a Elrix...");
         input.setHintTextColor(Color.rgb(113, 143, 164));
         input.setTextColor(Color.WHITE);
         input.setTextSize(16);
         input.setGravity(Gravity.TOP);
-        input.setPadding(dp(12), dp(10), dp(8), dp(10));
+        input.setPadding(dp(16), dp(12), dp(12), dp(12));
         input.setSingleLine(false);
         input.setMaxLines(4);
         input.setBackground(round(Color.rgb(15, 23, 38), dp(20)));
-        composer.addView(input, new LinearLayout.LayoutParams(0, dp(58), 1));
+        composer.addView(input, new LinearLayout.LayoutParams(0, dp(62), 1));
         Button send = button("↑", Color.rgb(24, 127, 220), Color.WHITE);
         send.setTextSize(25);
         send.setOnClickListener(v -> sendMessage());
-        LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(dp(48), dp(48));
-        sendParams.leftMargin = dp(8);
+        LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(dp(52), dp(52));
+        sendParams.leftMargin = dp(10);
         composer.addView(send, sendParams);
-        root.addView(composer, new LinearLayout.LayoutParams(-1, dp(72)));
+        root.addView(composer, new LinearLayout.LayoutParams(-1, dp(80)));
 
         voiceStatus = textView("Carregando voz neural local…", 10, Color.rgb(106, 132, 153));
         voiceStatus.setGravity(Gravity.CENTER);
@@ -609,7 +643,8 @@ public class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(user ? Gravity.RIGHT : Gravity.LEFT);
-        row.setPadding(0, 0, 0, dp(14));
+        row.setPadding(dp(4), 0, dp(4), dp(18));
+        row.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
 
         if (!user) {
             TextView avatar = textView("E", 15, Color.WHITE);
@@ -625,10 +660,16 @@ public class MainActivity extends Activity {
         bubbleBox.setOrientation(LinearLayout.VERTICAL);
         bubbleBox.setGravity(user ? Gravity.RIGHT : Gravity.LEFT);
         TextView bubble = textView(content, 16, Color.rgb(235, 246, 255));
-        bubble.setPadding(dp(15), dp(12), dp(15), dp(12));
+        bubble.setPadding(dp(17), dp(14), dp(17), dp(14));
         bubble.setGravity(Gravity.CENTER_VERTICAL);
+        bubble.setIncludeFontPadding(true);
         bubble.setBackground(round(user ? Color.rgb(12, 99, 190) : Color.rgb(15, 23, 38), dp(18)));
-        bubbleBox.addView(bubble, new LinearLayout.LayoutParams(dp(310), -2));
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int availableWidth = Math.max(dp(220), screenWidth - dp(40));
+        int maxBubbleWidth = (int) (availableWidth * (user ? 0.86f : 0.94f));
+        if (!user) maxBubbleWidth = Math.max(dp(210), maxBubbleWidth - dp(38));
+        bubble.setMaxWidth(maxBubbleWidth);
+        bubbleBox.addView(bubble, new LinearLayout.LayoutParams(-2, -2));
         if (streamingReplyActive && !user && index == conversation.length() - 1) {
             streamingBubble = bubble;
         }
@@ -644,12 +685,12 @@ public class MainActivity extends Activity {
         copy.setTextSize(11);
         copy.setAllCaps(false);
         copy.setOnClickListener(v -> copyMessage(content));
-        actions.addView(copy, new LinearLayout.LayoutParams(dp(76), dp(30)));
+        actions.addView(copy, new LinearLayout.LayoutParams(dp(64), dp(30)));
         if (!user && index > 0) {
             Button regenerate = button("Regenerar", Color.rgb(19, 48, 79), Color.rgb(150, 215, 255));
             regenerate.setTextSize(11);
             regenerate.setAllCaps(false);
-            LinearLayout.LayoutParams regenParams = new LinearLayout.LayoutParams(dp(92), dp(30));
+            LinearLayout.LayoutParams regenParams = new LinearLayout.LayoutParams(dp(82), dp(30));
             regenParams.leftMargin = dp(6);
             actions.addView(regenerate, regenParams);
             regenerate.setOnClickListener(v -> regenerateMessage(index));
@@ -658,14 +699,15 @@ public class MainActivity extends Activity {
             listen.setTextSize(11);
             listen.setAllCaps(false);
             listen.setContentDescription("Ouvir resposta da Elrix");
-            LinearLayout.LayoutParams listenParams = new LinearLayout.LayoutParams(dp(70), dp(30));
+            LinearLayout.LayoutParams listenParams = new LinearLayout.LayoutParams(dp(62), dp(30));
             listenParams.leftMargin = dp(6);
             actions.addView(listen, listenParams);
             listen.setOnClickListener(v -> speakMessage(content));
         }
         bubbleBox.addView(actions);
-        row.addView(bubbleBox, new LinearLayout.LayoutParams(dp(310), -2));
-        messagesLayout.addView(row);
+        bubbleBox.setPadding(0, 0, 0, dp(2));
+        row.addView(bubbleBox, new LinearLayout.LayoutParams(-2, -2));
+        messagesLayout.addView(row, new LinearLayout.LayoutParams(-1, -2));
     }
 
     private void showMessageActions(int index, boolean user) {
@@ -716,61 +758,74 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "A voz ainda está carregando", Toast.LENGTH_SHORT).show();
             return;
         }
-        textToSpeech.stop();
-        String remaining = content.trim();
-        boolean first = true;
-        while (!remaining.isEmpty()) {
-            int end = Math.min(remaining.length(), 3500);
-            if (end < remaining.length()) {
-                int boundary = remaining.lastIndexOf(' ', end);
-                if (boundary > 500) end = boundary;
+        speakWithAndroidFallback(content, generation);
+    }
+
+    private void speakWithAndroidFallback(String content, int generation) {
+        if (content == null || content.trim().isEmpty() || generation != speechGeneration) return;
+        mainHandler.post(() -> {
+            if (generation != speechGeneration || textToSpeech == null || !voiceReady) return;
+            textToSpeech.stop();
+            String remaining = content.trim();
+            boolean first = true;
+            while (!remaining.isEmpty() && generation == speechGeneration) {
+                int end = Math.min(remaining.length(), 3500);
+                if (end < remaining.length()) {
+                    int boundary = remaining.lastIndexOf(' ', end);
+                    if (boundary > 500) end = boundary;
+                }
+                String chunk = remaining.substring(0, end).trim();
+                textToSpeech.speak(chunk, first ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD, null, "elrix-response-" + end);
+                first = false;
+                remaining = remaining.substring(end).trim();
             }
-            String chunk = remaining.substring(0, end).trim();
-            textToSpeech.speak(chunk, first ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD, null, "elrix-response-" + end);
-            first = false;
-            remaining = remaining.substring(end).trim();
-        }
+        });
     }
 
     private void speakWithPiper(String content, int generation) {
         final BlockingQueue<PiperAudioChunk> queue = new ArrayBlockingQueue<>(PIPER_AUDIO_QUEUE_CAPACITY);
+        final AtomicBoolean pipelineCancelled = new AtomicBoolean(false);
         final Throwable[] producerError = new Throwable[1];
-        final String[] producerRemaining = new String[]{content};
         final Thread producer = new Thread(() -> {
             try {
-                String remaining = producerRemaining[0];
-                while (!remaining.isEmpty() && generation == speechGeneration) {
-                    int end = Math.min(remaining.length(), 900);
+                String remaining = content;
+                while (!remaining.isEmpty() && generation == speechGeneration && !pipelineCancelled.get()) {
+                    int end = Math.min(remaining.length(), PIPER_TEXT_CHUNK_CHARS);
                     if (end < remaining.length()) {
                         int boundary = remaining.lastIndexOf(' ', end);
-                        if (boundary > 200) end = boundary;
+                        if (boundary >= PIPER_TEXT_CHUNK_MIN_CHARS) end = boundary;
                     }
                     String chunk = remaining.substring(0, end).trim();
+                    if (chunk.isEmpty()) break;
                     GeneratedAudio audio;
-                    // Piper's native object is deliberately serialized.  The
-                    // producer is the only caller, while playback consumes the
-                    // already generated audio on the current speech worker.
+                    // OfflineTts is not re-entrant. Only this producer calls
+                    // generate(), and the lock also serializes prewarm/cancelled
+                    // jobs so a new speech request can never overlap native Piper.
                     synchronized (piperGenerationLock) {
-                        if (generation != speechGeneration) break;
+                        if (generation != speechGeneration || pipelineCancelled.get()) break;
                         audio = piperTts.generate(chunk, 0, PIPER_SPEED);
                     }
-                    PiperAudioChunk packet = new PiperAudioChunk(audio.getSamples(), audio.getSampleRate());
-                    while (generation == speechGeneration && !queue.offer(packet, 200, TimeUnit.MILLISECONDS)) {
-                        // Wait for AudioTrack to consume a queued chunk.
+                    if (audio == null || audio.getSamples() == null || audio.getSamples().length == 0) {
+                        throw new IllegalStateException("Piper retornou áudio vazio");
                     }
+                    PiperAudioChunk packet = new PiperAudioChunk(audio.getSamples(), audio.getSampleRate());
+                    // Bounded back-pressure: enough audio to bridge a slow next
+                    // native call, without retaining the whole response in RAM.
+                    while (generation == speechGeneration && !pipelineCancelled.get()
+                            && !queue.offer(packet, 100, TimeUnit.MILLISECONDS)) { }
                     remaining = remaining.substring(end).trim();
                 }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
             } catch (Throwable error) {
-                if (generation == speechGeneration) producerError[0] = error;
+                if (generation == speechGeneration && !pipelineCancelled.get()) producerError[0] = error;
             } finally {
-                if (generation != speechGeneration) {
-                    queue.clear();
-                } else {
+                if (generation == speechGeneration && !pipelineCancelled.get()) {
                     try {
-                        while (!queue.offer(PiperAudioChunk.end(producerError[0]), 200, TimeUnit.MILLISECONDS)) {
-                            // Let the consumer drain the final audio first.
+                        while (!queue.offer(PiperAudioChunk.end(producerError[0]), 100, TimeUnit.MILLISECONDS)) {
+                            if (pipelineCancelled.get()) break;
                         }
-                    } catch (InterruptedException ignored) {
+                    } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                     }
                 }
@@ -780,7 +835,7 @@ public class MainActivity extends Activity {
         AudioTrack track = null;
         producer.start();
         try {
-            while (generation == speechGeneration) {
+            while (generation == speechGeneration && !pipelineCancelled.get()) {
                 PiperAudioChunk packet = queue.poll(200, TimeUnit.MILLISECONDS);
                 if (packet == null) continue;
                 if (packet.end) {
@@ -788,11 +843,11 @@ public class MainActivity extends Activity {
                     break;
                 }
                 if (track == null) {
-                    // Reuse one PCM AudioTrack for every generated chunk.
                     int minBuffer = AudioTrack.getMinBufferSize(
                             packet.sampleRate, AudioFormat.CHANNEL_OUT_MONO,
                             AudioFormat.ENCODING_PCM_16BIT);
                     if (minBuffer <= 0) minBuffer = 8192;
+                    int timeBuffer = Math.max(8192, (packet.sampleRate * PIPER_AUDIO_BUFFER_MILLIS) / 1000);
                     AudioAttributes attributes = new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_MEDIA)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -802,7 +857,7 @@ public class MainActivity extends Activity {
                             .setSampleRate(packet.sampleRate)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build();
-                    track = new AudioTrack(attributes, format, Math.max(minBuffer, 8192),
+                    track = new AudioTrack(attributes, format, Math.max(minBuffer * 2, timeBuffer),
                             AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE);
                     if (track.getState() != AudioTrack.STATE_INITIALIZED) {
                         track.release();
@@ -818,28 +873,37 @@ public class MainActivity extends Activity {
                     pcm[i] = (short) (value * (value < 0 ? 32768 : 32767));
                 }
                 int offset = 0;
-                while (offset < pcm.length && generation == speechGeneration) {
+                while (offset < pcm.length && generation == speechGeneration && !pipelineCancelled.get()) {
                     int written = track.write(pcm, offset, pcm.length - offset, AudioTrack.WRITE_BLOCKING);
-                    if (written <= 0) break;
+                    if (written < 0) {
+                        throw new IllegalStateException("AudioTrack rejeitou PCM: " + written);
+                    }
+                    if (written == 0) {
+                        Thread.yield();
+                        continue;
+                    }
                     offset += written;
                 }
             }
-            if (producerError[0] != null) throw producerError[0];
-        } catch (InterruptedException error) {
+            if (producerError[0] != null && generation == speechGeneration) throw producerError[0];
+        } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         } catch (Throwable error) {
-            // Do not crash the conversation if a low-memory device rejects neural playback.
+            pipelineCancelled.set(true);
             piperReady = false;
             piperError = describePiperError(error);
             Log.e("ElrixPiper", "Piper playback failed: " + piperError, error);
             mainHandler.post(this::updateVoiceStatus);
+            // Preserve the Android voice fallback for this utterance.
+            if (generation == speechGeneration) speakWithAndroidFallback(content, generation);
         } finally {
-            if (generation != speechGeneration) producer.interrupt();
-            // Do not let a cancelled producer overlap the next native Piper call.
-            synchronized (piperGenerationLock) {
-                try { producer.join(1500); } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                }
+            pipelineCancelled.set(true);
+            producer.interrupt();
+            // Do not hold piperGenerationLock while waiting. A native call in
+            // progress remains serialized by that lock, and the next request
+            // will wait for it instead of running Piper concurrently.
+            try { producer.join(3000); } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
             }
             if (track != null) {
                 try { track.stop(); } catch (Exception ignored) { }
@@ -938,6 +1002,10 @@ public class MainActivity extends Activity {
         // endpoint can then paint the first token without waiting for the full answer.
         streamingReplyActive = true;
         streamingBubble = null;
+        streamingSpeechCandidate = null;
+        streamingSpeechPrefix = null;
+        streamingSpeechPendingTail = null;
+        streamingSpeechWorkerActive = false;
         addMessage("assistant", "");
         new Thread(() -> {
             try {
@@ -952,6 +1020,60 @@ public class MainActivity extends Activity {
 
     private void updateStreamingReply(String text) {
         if (streamingBubble != null) streamingBubble.setText(text);
+        if (autoRead && streamingReplyActive) {
+            streamingSpeechCandidate = chooseStreamingSpeech(text);
+            maybeStartStreamingSpeech();
+        }
+    }
+
+    /**
+     * Select a speakable prefix without waiting for the complete SSE reply.
+     * Punctuation wins; the length fallback avoids an indefinite wait from
+     * models that stream a long sentence without punctuation. It never cuts
+     * below a word boundary and is deliberately conservative for clarity.
+     */
+    private String chooseStreamingSpeech(String text) {
+        if (text == null) return null;
+        String value = text.trim();
+        if (value.length() < STREAM_SPEECH_MIN_CHARS) return null;
+        for (int i = STREAM_SPEECH_MIN_CHARS - 1; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '.' || c == '!' || c == '?' || c == '。' || c == '！' || c == '？' || c == '…') {
+                return value.substring(0, i + 1).trim();
+            }
+        }
+        if (value.length() >= STREAM_SPEECH_FALLBACK_CHARS) {
+            int boundary = value.lastIndexOf(' ', STREAM_SPEECH_FALLBACK_CHARS);
+            if (boundary >= STREAM_SPEECH_MIN_CHARS) return value.substring(0, boundary).trim();
+        }
+        return null;
+    }
+
+    private void maybeStartStreamingSpeech() {
+        if (!autoRead || !streamingReplyActive || streamingSpeechPrefix != null) return;
+        String candidate = streamingSpeechCandidate;
+        if (candidate == null || candidate.trim().isEmpty()) return;
+        if (!piperReady || piperTts == null) return;
+        streamingSpeechPrefix = candidate;
+        streamingSpeechWorkerActive = true;
+        final int generation = ++speechGeneration;
+        stopPiperPlayback();
+        speechExecutor.execute(() -> {
+            String next = candidate;
+            try {
+                while (next != null && !next.trim().isEmpty() && generation == speechGeneration) {
+                    speakWithPiper(next.trim(), generation);
+                    synchronized (streamingSpeechLock) {
+                        if (generation != speechGeneration) break;
+                        next = streamingSpeechPendingTail;
+                        streamingSpeechPendingTail = null;
+                        if (next == null) streamingSpeechWorkerActive = false;
+                    }
+                }
+            } finally {
+                synchronized (streamingSpeechLock) { streamingSpeechWorkerActive = false; }
+            }
+        });
     }
 
     private void finishStreamingReply(String reply, boolean failed) {
@@ -965,7 +1087,32 @@ public class MainActivity extends Activity {
         if (streamingBubble != null) streamingBubble.setText(reply);
         streamingBubble = null;
         saveConversation();
-        if (!failed && autoRead) speakMessage(reply);
+        if (!failed && autoRead) {
+            String alreadySpoken = streamingSpeechPrefix;
+            String tail = alreadySpoken == null ? reply.trim() : "";
+            if (alreadySpoken != null) {
+                // Deltas are cumulative, so the prefix spoken during SSE can
+                // be removed exactly. Never replay the completed reply.
+                if (reply.startsWith(alreadySpoken)) tail = reply.substring(alreadySpoken.length()).trim();
+                else tail = reply.trim();
+            }
+            if (!tail.isEmpty()) {
+                synchronized (streamingSpeechLock) {
+                    if (streamingSpeechWorkerActive && streamingSpeechPrefix != null) {
+                        streamingSpeechPendingTail = tail;
+                    } else {
+                        speakMessage(tail);
+                    }
+                }
+            }
+        }
+        streamingSpeechCandidate = null;
+        // Keep the prefix/tail state alive until the already-running neural
+        // worker consumes the final tail. A subsequent request resets it.
+        if (!streamingSpeechWorkerActive) {
+            streamingSpeechPrefix = null;
+            streamingSpeechPendingTail = null;
+        }
         sending = false;
         setLoading(false);
     }
