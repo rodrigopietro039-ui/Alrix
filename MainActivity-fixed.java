@@ -703,7 +703,7 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams listenParams = new LinearLayout.LayoutParams(dp(62), dp(30));
             listenParams.leftMargin = dp(6);
             actions.addView(listen, listenParams);
-            listen.setOnClickListener(v -> speakMessage(content));
+            listen.setOnClickListener(v -> speakMessageAt(index));
         }
         bubbleBox.addView(actions);
         bubbleBox.setPadding(0, 0, 0, dp(2));
