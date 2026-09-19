@@ -1,0 +1,177 @@
+--- a/MainActivity-fixed.java
++++ b/MainActivity-fixed.java
+@@ -72,6 +72,11 @@
+     // concurrent native calls.  0.94 is a subtle ~6% slowdown for clarity.
+     private static final float PIPER_SPEED = 0.94f;
+     private static final int PIPER_AUDIO_QUEUE_CAPACITY = 2;
++    // Keep the first neural utterance short enough to reach AudioTrack quickly.
++    // A sentence boundary is preferred; the bounded fallback is only used for
++    // long streams that have not emitted punctuation yet.
++    private static final int STREAM_SPEECH_MIN_CHARS = 12;
++    private static final int STREAM_SPEECH_FALLBACK_CHARS = 96;
+     private static final String PIPER_VOICE_DIR = "vits-piper-pt_BR-faber-medium";
+ 
+     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+@@ -86,6 +91,7 @@
+     // Offline neural voice: Piper pt_BR-faber-medium through Sherpa-ONNX.
+     private OfflineTts piperTts;
+     private volatile boolean piperReady = false;
++    private volatile boolean piperWarmed = false;
+     private volatile boolean piperInitFinished = false;
+     private volatile boolean piperDownloading = false;
+     private volatile String piperError = null;
+@@ -93,6 +99,7 @@
+     private final ExecutorService speechExecutor = Executors.newSingleThreadExecutor();
+     private volatile AudioTrack piperTrack;
+     private final Object piperGenerationLock = new Object();
++    private final Object streamingSpeechLock = new Object();
+ 
+     private static final class PiperAudioChunk {
+         final float[] samples;
+@@ -126,6 +133,12 @@
+     private boolean sending = false;
+     private boolean streamingReplyActive = false;
+     private TextView streamingBubble;
++    // Auto-read starts once the first complete sentence (or a bounded phrase)
++    // arrives over SSE. The final response only contributes its unspoken tail.
++    private String streamingSpeechCandidate = null;
++    private String streamingSpeechPrefix = null;
++    private String streamingSpeechPendingTail = null;
++    private boolean streamingSpeechWorkerActive = false;
+ 
+     private interface StreamListener {
+         void onText(String text);
+@@ -202,6 +215,14 @@
+                 piperTts = new OfflineTts(null, config);
+                 piperError = null;
+                 piperReady = true;
++                // Constructing the native object is not enough: the first
++                // generate() also pays model/JNI allocator costs. Pay that
++                // unavoidable one-time cost during startup, never on Ouvir.
++                mainHandler.post(this::updateVoiceStatus);
++                synchronized (piperGenerationLock) {
++                    piperTts.generate("Pronto.", 0, PIPER_SPEED);
++                }
++                piperWarmed = true;
+             } catch (Throwable error) {
+                 piperReady = false;
+                 piperError = describePiperError(error);
+@@ -209,7 +230,10 @@
+             } finally {
+                 piperDownloading = false;
+                 piperInitFinished = true;
+-                mainHandler.post(this::updateVoiceStatus);
++                mainHandler.post(() -> {
++                    updateVoiceStatus();
++                    maybeStartStreamingSpeech();
++                });
+             }
+         }, "elrix-piper-init").start();
+     }
+@@ -938,6 +962,10 @@
+         // endpoint can then paint the first token without waiting for the full answer.
+         streamingReplyActive = true;
+         streamingBubble = null;
++        streamingSpeechCandidate = null;
++        streamingSpeechPrefix = null;
++        streamingSpeechPendingTail = null;
++        streamingSpeechWorkerActive = false;
+         addMessage("assistant", "");
+         new Thread(() -> {
+             try {
+@@ -952,6 +980,60 @@
+ 
+     private void updateStreamingReply(String text) {
+         if (streamingBubble != null) streamingBubble.setText(text);
++        if (autoRead && streamingReplyActive) {
++            streamingSpeechCandidate = chooseStreamingSpeech(text);
++            maybeStartStreamingSpeech();
++        }
++    }
++
++    /**
++     * Select a speakable prefix without waiting for the complete SSE reply.
++     * Punctuation wins; the length fallback avoids an indefinite wait from
++     * models that stream a long sentence without punctuation. It never cuts
++     * below a word boundary and is deliberately conservative for clarity.
++     */
++    private String chooseStreamingSpeech(String text) {
++        if (text == null) return null;
++        String value = text.trim();
++        if (value.length() < STREAM_SPEECH_MIN_CHARS) return null;
++        for (int i = STREAM_SPEECH_MIN_CHARS - 1; i < value.length(); i++) {
++            char c = value.charAt(i);
++            if (c == '.' || c == '!' || c == '?' || c == '。' || c == '！' || c == '？' || c == '…') {
++                return value.substring(0, i + 1).trim();
++            }
++        }
++        if (value.length() >= STREAM_SPEECH_FALLBACK_CHARS) {
++            int boundary = value.lastIndexOf(' ', STREAM_SPEECH_FALLBACK_CHARS);
++            if (boundary >= STREAM_SPEECH_MIN_CHARS) return value.substring(0, boundary).trim();
++        }
++        return null;
++    }
++
++    private void maybeStartStreamingSpeech() {
++        if (!autoRead || !streamingReplyActive || streamingSpeechPrefix != null) return;
++        String candidate = streamingSpeechCandidate;
++        if (candidate == null || candidate.trim().isEmpty()) return;
++        if (!piperReady || piperTts == null) return;
++        streamingSpeechPrefix = candidate;
++        streamingSpeechWorkerActive = true;
++        final int generation = ++speechGeneration;
++        stopPiperPlayback();
++        speechExecutor.execute(() -> {
++            String next = candidate;
++            try {
++                while (next != null && !next.trim().isEmpty() && generation == speechGeneration) {
++                    speakWithPiper(next.trim(), generation);
++                    synchronized (streamingSpeechLock) {
++                        if (generation != speechGeneration) break;
++                        next = streamingSpeechPendingTail;
++                        streamingSpeechPendingTail = null;
++                        if (next == null) streamingSpeechWorkerActive = false;
++                    }
++                }
++            } finally {
++                synchronized (streamingSpeechLock) { streamingSpeechWorkerActive = false; }
++            }
++        });
++    }
+ 
+     private void finishStreamingReply(String reply, boolean failed) {
+@@ -965,7 +1047,32 @@
+         if (streamingBubble != null) streamingBubble.setText(reply);
+         streamingBubble = null;
+         saveConversation();
+-        if (!failed && autoRead) speakMessage(reply);
++        if (!failed && autoRead) {
++            String alreadySpoken = streamingSpeechPrefix;
++            String tail = alreadySpoken == null ? reply.trim() : "";
++            if (alreadySpoken != null) {
++                // Deltas are cumulative, so the prefix spoken during SSE can
++                // be removed exactly. Never replay the completed reply.
++                if (reply.startsWith(alreadySpoken)) tail = reply.substring(alreadySpoken.length()).trim();
++                else tail = reply.trim();
++            }
++            if (!tail.isEmpty()) {
++                synchronized (streamingSpeechLock) {
++                    if (streamingSpeechWorkerActive && streamingSpeechPrefix != null) {
++                        streamingSpeechPendingTail = tail;
++                    } else {
++                        speakMessage(tail);
++                    }
++                }
++            }
++        }
++        streamingSpeechCandidate = null;
++        // Keep the prefix/tail state alive until the already-running neural
++        // worker consumes the final tail. A subsequent request resets it.
++        if (!streamingSpeechWorkerActive) {
++            streamingSpeechPrefix = null;
++            streamingSpeechPendingTail = null;
++        }
+         sending = false;
+         setLoading(false);
+     }
+
