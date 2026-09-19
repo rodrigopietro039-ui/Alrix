@@ -35,7 +35,6 @@ jobs:
           done
           cp MainActivity-fixed.java android-app/app/src/main/java/com/elrixai/app/MainActivity.java
           cp OfflineTts-fixed.kt android-app/app/src/main/java/com/elrixai/app/OfflineTts.kt
-          python3 voice-latency.patch/voice-latency.patch
           rm -rf android-app/app/src/main/assets/vits-piper-pt_BR-faber-medium
           test ! -e android-app/app/src/main/assets/vits-piper-pt_BR-faber-medium
           python3 - <<'PY'
@@ -62,14 +61,17 @@ jobs:
           echo "ELRIX_KEY_PASSWORD=ElrixRelease2026!" >> "$GITHUB_ENV"
       - name: Gerar APK oficial Release
         run: gradle -p android-app assembleRelease --no-daemon
-      - name: Verificar ABIs no APK
+      - name: Verificar integridade e ABIs no APK
         run: |
           set -euo pipefail
           apk=android-app/app/build/outputs/apk/release/app-release.apk
-          unzip -l "$apk" | grep -E 'lib/(arm64-v8a|armeabi-v7a)/(libsherpa-onnx-jni|libonnxruntime)\.so'
-          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libsherpa-onnx-jni.so'
-          unzip -l "$apk" | grep -q 'lib/armeabi-v7a/libsherpa-onnx-jni.so'
-          unzip -l "$apk" | grep -q 'lib/armeabi-v7a/libonnxruntime.so'
+          unzip -t "$apk" >/dev/null
+          for abi in arm64-v8a armeabi-v7a; do
+            for lib in libonnxruntime.so libsherpa-onnx-c-api.so libsherpa-onnx-cxx-api.so libsherpa-onnx-jni.so; do
+              unzip -l "$apk" | grep -q "lib/$abi/$lib"
+            done
+          done
+          echo "Verified Sherpa/Piper native libraries for arm64-v8a and armeabi-v7a"
       - uses: actions/upload-artifact@v4
         with:
           name: elrix-ai-apk-oficial
