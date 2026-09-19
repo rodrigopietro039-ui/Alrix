@@ -1,6 +1,10 @@
 --- a/MainActivity-fixed.java
 +++ b/MainActivity-fixed.java
-@@ -72,6 +72,11 @@
+@@ -68,35 +68,42 @@
+     private static final String AUTO_READ = "auto_read";
+     private static final String PIPER_VOICE_PART_URL = "https://raw.githubusercontent.com/rodrigopietro039-ui/Alrix/main/elrix-piper-voice.part%02d";
+     private static final int PIPER_VOICE_PARTS = 9;
+     // A small pipeline keeps Piper generation ahead of AudioTrack without making
      // concurrent native calls.  0.94 is a subtle ~6% slowdown for clarity.
      private static final float PIPER_SPEED = 0.94f;
      private static final int PIPER_AUDIO_QUEUE_CAPACITY = 2;
@@ -12,7 +16,14 @@
      private static final String PIPER_VOICE_DIR = "vits-piper-pt_BR-faber-medium";
  
      private final Handler mainHandler = new Handler(Looper.getMainLooper());
-@@ -86,6 +91,7 @@
+     private LinearLayout messagesLayout;
+     private EditText input;
+     private TextView modeLabel;
+     private TextView typingIndicator;
+     private ScrollView conversationScroll;
+     private AlphaAnimation typingAnimation;
+     private TextToSpeech textToSpeech;
+     private boolean voiceReady = false;
      // Offline neural voice: Piper pt_BR-faber-medium through Sherpa-ONNX.
      private OfflineTts piperTts;
      private volatile boolean piperReady = false;
@@ -20,7 +31,7 @@
      private volatile boolean piperInitFinished = false;
      private volatile boolean piperDownloading = false;
      private volatile String piperError = null;
-@@ -93,6 +99,7 @@
+     private TextView voiceStatus;
      private final ExecutorService speechExecutor = Executors.newSingleThreadExecutor();
      private volatile AudioTrack piperTrack;
      private final Object piperGenerationLock = new Object();
@@ -28,7 +39,15 @@
  
      private static final class PiperAudioChunk {
          final float[] samples;
-@@ -126,6 +133,12 @@
+         final int sampleRate;
+         final Throwable error;
+         final boolean end;
+ 
+@@ -122,14 +129,20 @@
+     private Button autoReadButton;
+     private JSONArray conversation = new JSONArray();
+     private JSONArray sessions = new JSONArray();
+     private String mode = "criativa";
      private boolean sending = false;
      private boolean streamingReplyActive = false;
      private TextView streamingBubble;
@@ -41,7 +60,15 @@
  
      private interface StreamListener {
          void onText(String text);
-@@ -202,6 +215,14 @@
+     }
+ 
+     private int dp(float value) {
+         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+@@ -198,22 +211,33 @@
+ 
+                 OfflineTtsConfig config = new OfflineTtsConfig();
+                 config.setModel(model);
+                 config.setMaxNumSentences(1);
                  piperTts = new OfflineTts(null, config);
                  piperError = null;
                  piperReady = true;
@@ -56,7 +83,7 @@
              } catch (Throwable error) {
                  piperReady = false;
                  piperError = describePiperError(error);
-@@ -209,7 +230,10 @@
+                 Log.e("ElrixPiper", "Piper initialization failed: " + piperError, error);
              } finally {
                  piperDownloading = false;
                  piperInitFinished = true;
@@ -68,7 +95,15 @@
              }
          }, "elrix-piper-init").start();
      }
-@@ -938,6 +962,10 @@
+ 
+     private File ensurePiperVoice() throws Exception {
+     
+     
+@@ -934,42 +958,125 @@
+         if (sending) return;
+         sending = true;
+         setLoading(true);
+         // Create the assistant bubble before the network call. The streaming
          // endpoint can then paint the first token without waiting for the full answer.
          streamingReplyActive = true;
          streamingBubble = null;
@@ -79,7 +114,14 @@
          addMessage("assistant", "");
          new Thread(() -> {
              try {
-@@ -952,6 +980,60 @@
+                 String reply = callBackend(mode, text -> mainHandler.post(() -> updateStreamingReply(text)));
+                 mainHandler.post(() -> finishStreamingReply(reply, false));
+             } catch (Exception error) {
+                 mainHandler.post(() -> finishStreamingReply(
+                         "Tive um problema de conexão agora. Tente novamente em alguns instantes.", true));
+             }
+         }, "elrix-chat-request").start();
+     }
  
      private void updateStreamingReply(String text) {
          if (streamingBubble != null) streamingBubble.setText(text);
@@ -138,13 +180,18 @@
 +            }
 +        });
 +    }
- 
-     private void finishStreamingReply(String reply, boolean failed) {
-@@ -965,7 +1047,32 @@
-         if (streamingBubble != null) streamingBubble.setText(reply);
-         streamingBubble = null;
-         saveConversation();
--        if (!failed && autoRead) speakMessage(reply);
++
++    private void finishStreamingReply(String reply, boolean failed) {
++        try {
++            if (conversation.length() > 0) {
++                JSONObject last = conversation.getJSONObject(conversation.length() - 1);
++                if ("assistant".equals(last.optString("role"))) last.put("content", reply);
++            }
++        } catch (Exception ignored) { }
++        streamingReplyActive = false;
++        if (streamingBubble != null) streamingBubble.setText(reply);
++        streamingBubble = null;
++        saveConversation();
 +        if (!failed && autoRead) {
 +            String alreadySpoken = streamingSpeechPrefix;
 +            String tail = alreadySpoken == null ? reply.trim() : "";
@@ -171,7 +218,23 @@
 +            streamingSpeechPrefix = null;
 +            streamingSpeechPendingTail = null;
 +        }
-         sending = false;
-         setLoading(false);
++        sending = false;
++        setLoading(false);
++    }
+ 
+     private void setLoading(boolean loading) {
+         typingIndicator.setVisibility(loading ? View.VISIBLE : View.GONE);
+         if (loading) {
+             typingAnimation = new AlphaAnimation(0.35f, 1.0f);
+             typingAnimation.setDuration(650);
+             typingAnimation.setRepeatMode(Animation.REVERSE);
+             typingAnimation.setRepeatCount(Animation.INFINITE);
+             typingIndicator.startAnimation(typingAnimation);
+         } else {
+             typingIndicator.clearAnimation();
+         }
+         scrollToBottom();
      }
-
+ 
+     private void scrollToBottom() {
+         if (conversationScroll != null) conversationScroll.post(() -> conversationScroll.fullScroll(View.FOCUS_DOWN));
